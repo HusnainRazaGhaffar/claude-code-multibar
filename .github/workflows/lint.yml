@@ -1,0 +1,16 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: bash -n statusline.sh
+      - name: ShellCheck (max verbosity, zero findings expected)
+        run: shellcheck -S style statusline.sh

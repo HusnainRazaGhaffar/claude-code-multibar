@@ -1,0 +1,9 @@
+# Runtime artifacts of statusline.sh - these cache the raw response of an
+# undocumented Anthropic endpoint; never commit them (schema + usage data).
+usage_api_last_good.json
+usage_cache.json
+claude-statusline-*/
+
+# Editor/backup noise
+*.bak*
+*.swp
