@@ -121,7 +121,11 @@ is_cache_valid() {
 }
 
 # Read and validate input (no IFS save/restore needed - subshell isolation)
-input=$(timeout 2 cat)
+if command -v timeout >/dev/null 2>&1; then
+    input=$(timeout 2 cat)
+else
+    input=$(cat)  # macOS has no GNU timeout; stdin is closed by Claude Code so cat returns
+fi
 if ! printf '%s\n' "$input" | jq empty >/dev/null 2>&1; then
     echo "Error: Invalid JSON input" >&2
     exit 1
@@ -375,28 +379,33 @@ fetch_usage_data() {
                 # Actually fetch from OAuth API
                 local creds_file="${HOME}/.claude/.credentials.json"
                 local fetched=false
+                local token=""
                 if [[ -f "$creds_file" ]]; then
-                    local token
                     token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
-                    if [[ -n "$token" ]]; then
-                        local resp
-                        resp=$(printf 'header = "Authorization: Bearer %s"\n' "$token" | \
-                            curl -s -m 5 -K - \
-                                -H "anthropic-beta: oauth-2025-04-20" \
-                                -H "User-Agent: claude-code/${cc_version:-2.1.17}" \
-                                "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
-                        if printf '%s\n' "$resp" | jq -e '.five_hour' >/dev/null 2>&1; then
-                            write_cache_atomic "$api_cache" "$resp"
-                            # Persist last good response (survives reboots)
-                            write_cache_atomic "$persistent_cache" "$resp"
-                            rm -f -- "$fail_marker" 2>/dev/null
-                            fetched=true
-                            exec {lock_fd}>&-
-                            printf '%s\n' "$resp"
-                            return 0
-                        fi
-                        debug_log "OAuth API returned unexpected response"
+                fi
+                # macOS: Claude Code stores OAuth creds in the Keychain, not .credentials.json
+                if [[ -z "$token" ]] && command_exists security; then
+                    token=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | \
+                        jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+                fi
+                if [[ -n "$token" ]]; then
+                    local resp
+                    resp=$(printf 'header = "Authorization: Bearer %s"\n' "$token" | \
+                        curl -s -m 5 -K - \
+                            -H "anthropic-beta: oauth-2025-04-20" \
+                            -H "User-Agent: claude-code/${cc_version:-2.1.17}" \
+                            "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
+                    if printf '%s\n' "$resp" | jq -e '.five_hour' >/dev/null 2>&1; then
+                        write_cache_atomic "$api_cache" "$resp"
+                        # Persist last good response (survives reboots)
+                        write_cache_atomic "$persistent_cache" "$resp"
+                        rm -f -- "$fail_marker" 2>/dev/null
+                        fetched=true
+                        exec {lock_fd}>&-
+                        printf '%s\n' "$resp"
+                        return 0
                     fi
+                    debug_log "OAuth API returned unexpected response"
                 fi
 
                 # API failed: record failure for backoff
