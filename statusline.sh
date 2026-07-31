@@ -2,7 +2,36 @@
 # Optimized statusline for Claude Code
 # Requires bash >= 4.4 (named FDs, printf %(...)T, empty-array nounset
 # semantics). macOS: install a modern bash (brew install bash); flock(1)
-# is optional and the fetch proceeds unlocked without it.
+# is optional for read-only fetches (they proceed unlocked without it), but
+# the Grok token refresh REQUIRES it and is skipped when absent (fail closed:
+# an unlocked concurrent refresh can revoke the token family).
+# v4.0 - Provider hardening + sub-agent companion
+# - Grok: refresh fail-closed without flock; refresh token moved off curl argv
+#   (config via stdin); segment self-hides when no ~/.grok/auth.json exists;
+#   hour-old orphaned auth temp files swept.
+# - Codex: bounded coproc reap (stdin EOF, short poll, then pkill the tree);
+#   fd redirect order keeps bash diagnostics out of the panel; float duration
+#   and epoch resetsAt normalized defensively.
+# - Publishes the session effort level to the shared cache so the companion
+#   subagent-statusline.sh can render inherited effort per agent row.
+# v3.9 - macOS credentials + debug polish
+# - Keychain-aware login hint (credentials_present, presence-only probe, cached).
+# - CLAUDE_CONFIG_DIR / CLAUDE_SECURESTORAGE_CONFIG_DIR honored for the
+#   credentials file; gtimeout fallback for the stdin read.
+# - STATUSLINE_DEBUG output actually reaches stderr (call-site and exec
+#   redirect scoping); shared run_with_timeout helper.
+# v3.8 - Grok weekly credit limit
+# - When the active model is Grok, render SuperGrok weekly credit usage
+#   (creditUsagePercent + period end) from cli-chat-proxy billing?format=credits.
+# - OIDC access-token refresh against auth.x.ai, written back to ~/.grok/auth.json.
+# v3.7 - OpenAI quota progress bars
+# - Render Codex 5-hour and weekly utilization with the same colored bars,
+#   icons, and reset countdowns used by the other provider limit displays.
+# v3.6 - Gateway quota and context metadata
+# - Render ChatGPT/Codex quota windows for OpenAI models by querying the
+#   authenticated local `codex app-server`; no OAuth token parsing or copying.
+# - Recognize Grok 4.5's documented 500K context window.
+# - Session cost segment (💰) from Claude Code's cost.total_cost_usd.
 # v3.5 - Publish hardening
 # - chmod 700 on the shared cache root (was umask-dependent under /tmp fallback).
 # - flock optional: fetch proceeds unlocked where flock(1) is absent (macOS).
@@ -41,10 +70,14 @@ IFS=$'\n\t'
 # ---- Configuration ----
 readonly STATUSLINE_CACHE_TTL="${STATUSLINE_CACHE_TTL:-30}"
 readonly STATUSLINE_USAGE_TTL="${STATUSLINE_USAGE_TTL:-300}"
+readonly STATUSLINE_CODEX_TTL="${STATUSLINE_CODEX_TTL:-300}"
 readonly STATUSLINE_KIMI_TTL="${STATUSLINE_KIMI_TTL:-300}"
 readonly STATUSLINE_GLM_TTL="${STATUSLINE_GLM_TTL:-300}"
+readonly STATUSLINE_GROK_TTL="${STATUSLINE_GROK_TTL:-300}"
 readonly STATUSLINE_DEBUG="${STATUSLINE_DEBUG:-false}"
 readonly STATUSLINE_USAGE_FAIL_BACKOFF="${STATUSLINE_USAGE_FAIL_BACKOFF:-300}"
+readonly STATUSLINE_CODEX_FAIL_BACKOFF="${STATUSLINE_CODEX_FAIL_BACKOFF:-60}"
+readonly STATUSLINE_GROK_FAIL_BACKOFF="${STATUSLINE_GROK_FAIL_BACKOFF:-60}"
 readonly PROGRESS_BAR_WIDTH=10
 readonly TRANSCRIPT_TAIL_LINES=20
 
@@ -82,6 +115,19 @@ fi
 
 # ---- Helper Functions ----
 command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+# run_with_timeout SECS CMD...: GNU timeout, gtimeout (macOS + coreutils),
+# or plain CMD on stock macOS, where Claude Code closes stdin so reads return
+run_with_timeout() {
+    local secs="$1"; shift
+    if command_exists timeout; then
+        timeout "$secs" "$@"
+    elif command_exists gtimeout; then
+        gtimeout "$secs" "$@"
+    else
+        "$@"
+    fi
+}
 
 # Claude Code relocates its config dir via these env vars; the statusline inherits its env
 readonly CLAUDE_CFG_DIR="${CLAUDE_SECURESTORAGE_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-${HOME}/.claude}}"
@@ -131,10 +177,19 @@ maybe_cleanup_sessions() {
     find "$BASE_CACHE_DIR" -maxdepth 2 -type f -mmin +60 \
         \( -name 'usage_api_shared.??????' \
         -o -name 'usage_api.fail.??????' \
+        -o -name 'codex_rate_limits_shared.??????' \
+        -o -name 'codex_rate_limits.fail.??????' \
         -o -name 'kimi_balance.??????' \
         -o -name 'glm_quota.??????' \
+        -o -name 'grok_billing_shared.??????' \
+        -o -name 'grok_billing.fail.??????' \
         -o -name 'context_*.??????' \
         -o -name 'previous_tokens.??????' \) \
+        -delete 2>/dev/null
+    # Lock files are deliberately not swept: unlinking a held lock makes the
+    # next opener lock a different inode, breaking mutual exclusion.
+    # A render killed mid-refresh can orphan a mktemp file holding tokens
+    find "${HOME}/.grok" -maxdepth 1 -name 'auth.json.??????' -type f -mmin +60 \
         -delete 2>/dev/null
 }
 
@@ -147,13 +202,7 @@ is_cache_valid() {
 }
 
 # Read and validate input (no IFS save/restore needed - subshell isolation)
-if command_exists timeout; then
-    input=$(timeout 2 cat)
-elif command_exists gtimeout; then
-    input=$(gtimeout 2 cat)  # macOS with GNU coreutils installed
-else
-    input=$(cat)  # stock macOS: Claude Code closes stdin, so cat returns
-fi
+input=$(run_with_timeout 2 cat)
 if ! printf '%s\n' "$input" | jq empty >/dev/null 2>&1; then
     echo "Error: Invalid JSON input" >&2
     exit 1
@@ -176,21 +225,23 @@ if command_exists jq; then
             (.context_window.current_usage.input_tokens // ""),
             (.context_window.current_usage.cache_creation_input_tokens // ""),
             (.context_window.current_usage.cache_read_input_tokens // ""),
-            (.effort.level // "")
+            (.effort.level // ""),
+            ((((.cost.total_cost_usd // 0) | tonumber? // 0) * 100 | round) as $k
+             | if $k > 0 then "\($k / 100 | floor).\((($k % 100) + 100) | tostring[1:])" else "" end)
         ] | map(tostring) | join("\u001f")
     ' 2>/dev/null)
 
     if [[ -n "$json_values" ]]; then
-        IFS=$'\x1f' read -r raw_model_name cc_version session_id current_dir transcript_path cw_size cw_used_pct cw_input cw_cache_create cw_cache_read effort_level <<< "$json_values"
+        IFS=$'\x1f' read -r raw_model_name cc_version session_id current_dir transcript_path cw_size cw_used_pct cw_input cw_cache_create cw_cache_read effort_level cost_usd <<< "$json_values"
     else
         raw_model_name="Sonnet 4" cc_version="v1.0.85"
         session_id="" current_dir="" transcript_path="" cw_size=""
-        cw_used_pct="" cw_input="" cw_cache_create="" cw_cache_read="" effort_level=""
+        cw_used_pct="" cw_input="" cw_cache_create="" cw_cache_read="" effort_level="" cost_usd=""
     fi
 else
     raw_model_name="Sonnet 4" cc_version="v1.0.85"
     session_id="" current_dir="" transcript_path="" cw_size=""
-    cw_used_pct="" cw_input="" cw_cache_create="" cw_cache_read="" effort_level=""
+    cw_used_pct="" cw_input="" cw_cache_create="" cw_cache_read="" effort_level="" cost_usd=""
 fi
 
 # Format model name
@@ -246,6 +297,8 @@ get_max_context() {
         *"sonnet"*)               echo "200000" ;;
         *"haiku"*)                 echo "200000" ;;
         *"fable"*)                 echo "1000000" ;;
+        # xAI: Grok 4.5 has a 500K context window (hyphen and space spellings).
+        *"grok-4.5"*|*"grok 4.5"*) echo "500000" ;;
         *)                         echo "200000" ;;
     esac
 }
@@ -284,6 +337,19 @@ mkdir -p "$BASE_CACHE_DIR" 2>/dev/null
 chmod 700 "$BASE_CACHE_DIR" 2>/dev/null
 mkdir -p "$CACHE_DIR" 2>/dev/null
 chmod 700 "$CACHE_DIR" 2>/dev/null
+
+# Share the session's effort with subagent-statusline.sh: its payload carries
+# no effort, and agents without a pinned one run at the session's level.
+if [[ -n "${session_id:-}" && "$session_id" != "null" ]]; then
+    if [[ -n "$effort_level" ]]; then
+        if [[ ! -f "$CACHE_DIR/effort" || "$(<"$CACHE_DIR/effort")" != "$effort_level" ]]; then
+            write_cache_atomic "$CACHE_DIR/effort" "$effort_level"
+        fi
+    else
+        # Effort left the payload: clear, or agent rows inherit a stale level.
+        rm -f -- "$CACHE_DIR/effort" 2>/dev/null
+    fi
+fi
 
 # ---- Progress bar with color support ----
 progress_bar() {
@@ -405,6 +471,11 @@ fetch_usage_data() {
                     return 0
                 fi
 
+                # Claim the backoff before the fetch: a render killed mid-fetch
+                # would otherwise leave no marker and every render would stall.
+                # Success removes it; a completed failure refreshes it below.
+                write_cache_atomic "$fail_marker" "${EPOCHSECONDS:-$(date +%s)}"
+
                 # Actually fetch from OAuth API
                 local fetched=false
                 local token=""
@@ -468,6 +539,159 @@ fetch_usage_data() {
             printf '%s\n' "$manual_data"
             return 0
         fi
+    fi
+
+    return 1
+}
+
+# ---- ChatGPT/Codex Rate Limits ----
+# Query Codex's supported local app-server interface so this status line uses
+# the same authenticated quota snapshot as the Codex TUI. Only the sanitized
+# rate-limit windows are cached; account identity and OAuth credentials never
+# leave Codex's own process.
+
+# Close the pipe and reap the whole coproc tree, bounded. $1 is the coproc
+# SUBSHELL pid: codex runs beneath it (via timeout), so signal its children
+# too; the server exits on stdin EOF, but its shutdown flushes telemetry over
+# the network and must never hold the render hostage.
+codex_reap() {
+    local pid="$1" wfd="${2:-}"
+    [[ -n "$wfd" ]] && { { exec {wfd}>&-; } 2>/dev/null || true; }
+    [[ -n "$pid" ]] || return 0
+    for _ in 1 2 3 4; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.25
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        command_exists pkill && pkill -TERM -P "$pid" 2>/dev/null
+        kill "$pid" 2>/dev/null
+        sleep 0.1
+        # TERM ignored (wedged server): escalate so nothing outlives the render
+        if kill -0 "$pid" 2>/dev/null; then
+            command_exists pkill && pkill -KILL -P "$pid" 2>/dev/null
+            kill -KILL "$pid" 2>/dev/null
+        fi
+    fi
+    wait "$pid" 2>/dev/null || true
+}
+
+fetch_codex_rate_limits_live() {
+    command_exists codex || return 1
+
+    local read_fd write_fd init_response="" line="" rate_response=""
+    local codex_pid=""
+
+    coproc CODEX_STATUS { run_with_timeout 6 codex app-server 2>/dev/null; }
+    read_fd="${CODEX_STATUS[0]:-}"
+    write_fd="${CODEX_STATUS[1]:-}"
+    codex_pid="${CODEX_STATUS_PID:-}"
+    if [[ -z "$read_fd" || -z "$write_fd" ]]; then
+        codex_reap "$codex_pid" ""
+        return 1
+    fi
+
+    # stderr is silenced FIRST: redirection processing stops at the first
+    # failure, so a dead write fd would otherwise print a bash diagnostic.
+    if ! printf '%s\n' \
+        '{"method":"initialize","id":1,"params":{"clientInfo":{"name":"claude-statusline","title":"Claude Statusline","version":"1.0.0"}}}' \
+        2>/dev/null 1>&"$write_fd"; then
+        codex_reap "$codex_pid" "$write_fd"
+        return 1
+    fi
+
+    # Ignore unrelated startup notifications and wait for initialize.
+    for _ in {1..5}; do
+        line=""
+        IFS= read -r -t 1 -u "$read_fd" line 2>/dev/null || true
+        if [[ -n "$line" ]] && [[ "$(printf '%s\n' "$line" | jq -r '.id // empty' 2>/dev/null)" == "1" ]]; then
+            init_response="$line"
+            break
+        fi
+    done
+
+    if ! printf '%s\n' "$init_response" | jq -e '.id == 1 and .result' >/dev/null 2>&1; then
+        codex_reap "$codex_pid" "$write_fd"
+        debug_log "Codex app-server did not answer initialize"
+        return 1
+    fi
+
+    printf '%s\n' '{"method":"initialized","params":{}}' 2>/dev/null 1>&"$write_fd" || true
+    printf '%s\n' '{"method":"account/rateLimits/read","id":2,"params":{}}' 2>/dev/null 1>&"$write_fd" || true
+
+    for _ in {1..8}; do
+        line=""
+        IFS= read -r -t 1 -u "$read_fd" line 2>/dev/null || true
+        if [[ -n "$line" ]] && [[ "$(printf '%s\n' "$line" | jq -r '.id // empty' 2>/dev/null)" == "2" ]]; then
+            rate_response="$line"
+            break
+        fi
+    done
+
+    codex_reap "$codex_pid" "$write_fd"
+
+    printf '%s\n' "$rate_response" | jq -ce '
+        .result.rateLimits
+        | {
+            primary: (if .primary then {
+                usedPercent: .primary.usedPercent,
+                windowDurationMins: .primary.windowDurationMins,
+                resetsAt: .primary.resetsAt
+            } else null end),
+            secondary: (if .secondary then {
+                usedPercent: .secondary.usedPercent,
+                windowDurationMins: .secondary.windowDurationMins,
+                resetsAt: .secondary.resetsAt
+            } else null end)
+        }
+        | select((.primary.usedPercent? != null) or (.secondary.usedPercent? != null))
+    ' 2>/dev/null
+}
+
+fetch_codex_rate_limits() {
+    local cache_file="$BASE_CACHE_DIR/codex_rate_limits_shared"
+    local lock_file="$BASE_CACHE_DIR/codex_rate_limits.lock"
+    local fail_marker="$BASE_CACHE_DIR/codex_rate_limits.fail"
+    local lock_fd="" response=""
+
+    if is_cache_valid "$cache_file" "$STATUSLINE_CODEX_TTL"; then
+        cat "$cache_file" 2>/dev/null
+        return 0
+    fi
+
+    if ! is_cache_valid "$fail_marker" "$STATUSLINE_CODEX_FAIL_BACKOFF"; then
+        if { exec {lock_fd}>"$lock_file"; } 2>/dev/null && [[ -n "$lock_fd" ]]; then
+            if ! command_exists flock || flock -w 4 "$lock_fd" 2>/dev/null; then
+                if is_cache_valid "$cache_file" "$STATUSLINE_CODEX_TTL"; then
+                    exec {lock_fd}>&-
+                    cat "$cache_file" 2>/dev/null
+                    return 0
+                fi
+
+                # Claim the backoff before the fetch: a render killed mid-fetch
+                # would otherwise leave no marker and every render would stall.
+                # Success removes it; a completed failure refreshes it below.
+                write_cache_atomic "$fail_marker" "${EPOCHSECONDS:-$(date +%s)}"
+
+                if response=$(fetch_codex_rate_limits_live) && [[ -n "$response" ]]; then
+                    write_cache_atomic "$cache_file" "$response"
+                    rm -f -- "$fail_marker" 2>/dev/null
+                    exec {lock_fd}>&-
+                    printf '%s\n' "$response"
+                    return 0
+                fi
+                debug_log "Codex rate-limit fetch produced no data"
+
+                write_cache_atomic "$fail_marker" "${EPOCHSECONDS:-$(date +%s)}"
+            fi
+            exec {lock_fd}>&-
+        fi
+    fi
+
+    # A stale quota snapshot is preferable to hiding the meter during a brief
+    # network or Codex startup failure.
+    if [[ -f "$cache_file" ]]; then
+        cat "$cache_file" 2>/dev/null
+        return 0
     fi
 
     return 1
@@ -541,8 +765,376 @@ fetch_glm_quota() {
     return 1
 }
 
+# ---- Grok (xAI) SuperGrok weekly credit usage ----
+# Auth: ~/.grok/auth.json OIDC entry (key = access token).
+# Weekly window: GET https://cli-chat-proxy.grok.com/v1/billing?format=credits
+# Renders config.creditUsagePercent + config.currentPeriod.end only.
+
+grok_auth_path() {
+    printf '%s' "${HOME}/.grok/auth.json"
+}
+
+# Print: access_token \x1f auth_entry_key \x1f refresh_token \x1f client_id \x1f expires_at
+# Prefers https://auth.x.ai:: entries; falls back to the first object entry.
+grok_read_auth_fields() {
+    local auth_file
+    auth_file=$(grok_auth_path)
+    [[ -f "$auth_file" ]] || return 1
+    command_exists jq || return 1
+
+    jq -r '
+        def pick:
+            to_entries
+            | (map(select(.key | startswith("https://auth.x.ai::"))) | .[0])
+              // .[0]
+            | select(. != null);
+        pick
+        | [
+            (.value.key // .value.access_token // ""),
+            .key,
+            (.value.refresh_token // ""),
+            (.value.oidc_client_id // .value.client_id // ""),
+            (.value.expires_at // "")
+          ]
+        | map(tostring)
+        | join("\u001f")
+    ' "$auth_file" 2>/dev/null
+}
+
+# True (exit 0) when token is missing or expires within 120s.
+# Uses the later of file expires_at and JWT exp so a stale expires_at
+# cannot force a refresh while the access token is still valid.
+grok_token_needs_refresh() {
+    local token="${1:-}" expires_at="${2:-}"
+    [[ -z "$token" ]] && return 0
+
+    local now_epoch file_exp="" jwt_exp="" exp_epoch=""
+    now_epoch=${EPOCHSECONDS:-$(date +%s)}
+
+    if [[ -n "$expires_at" ]]; then
+        file_exp=$(to_epoch "$expires_at" 2>/dev/null || true)
+    fi
+
+    if command_exists python3; then
+        jwt_exp=$(TOKEN="$token" python3 - <<'PY' 2>/dev/null
+import base64, json, os, sys
+tok = os.environ.get("TOKEN", "")
+parts = tok.split(".")
+if len(parts) < 2:
+    sys.exit(1)
+pad = "=" * ((4 - len(parts[1]) % 4) % 4)
+try:
+    payload = json.loads(base64.urlsafe_b64decode(parts[1] + pad))
+except Exception:
+    sys.exit(1)
+exp = payload.get("exp")
+if exp is None:
+    sys.exit(1)
+print(int(exp))
+PY
+) || jwt_exp=""
+    fi
+
+    if [[ "$file_exp" =~ ^[0-9]+$ && "$jwt_exp" =~ ^[0-9]+$ ]]; then
+        if (( jwt_exp > file_exp )); then exp_epoch=$jwt_exp; else exp_epoch=$file_exp; fi
+    elif [[ "$jwt_exp" =~ ^[0-9]+$ ]]; then
+        exp_epoch=$jwt_exp
+    elif [[ "$file_exp" =~ ^[0-9]+$ ]]; then
+        exp_epoch=$file_exp
+    else
+        return 0
+    fi
+
+    (( exp_epoch - now_epoch <= 120 ))
+}
+
+# Refresh OIDC access token; write back to ~/.grok/auth.json under flock.
+# Prints the fresh access token on success.
+grok_refresh_access_token() {
+    local auth_file lock_file lock_fd=""
+    auth_file=$(grok_auth_path)
+    [[ -f "$auth_file" ]] || return 1
+    command_exists jq || return 1
+
+    # Refresh only under a real lock: concurrent renders re-sending the same
+    # refresh token trip the IdP's reuse detection and can revoke the whole
+    # token family, signing the Grok CLI out. No flock -> no refresh.
+    if ! command_exists flock; then
+        debug_log "Grok auth: flock unavailable; skipping refresh"
+        return 1
+    fi
+
+    lock_file="${BASE_CACHE_DIR}/grok_auth.lock"
+    mkdir -p "$BASE_CACHE_DIR" 2>/dev/null
+
+    if ! { exec {lock_fd}>"$lock_file"; } 2>/dev/null || [[ -z "$lock_fd" ]]; then
+        debug_log "Grok auth: failed to open lock"
+        return 1
+    fi
+
+    if ! flock -w 6 "$lock_fd" 2>/dev/null; then
+        exec {lock_fd}>&-
+        debug_log "Grok auth: flock timeout"
+        return 1
+    fi
+
+    # Re-read under lock; another process (or grok CLI) may have refreshed.
+    local fields token entry_key refresh_token client_id expires_at
+    fields=$(grok_read_auth_fields 2>/dev/null) || fields=""
+    if [[ -z "$fields" ]]; then
+        exec {lock_fd}>&-
+        return 1
+    fi
+    IFS=$'\x1f' read -r token entry_key refresh_token client_id expires_at <<< "$fields"
+
+    if [[ -n "$token" ]] && ! grok_token_needs_refresh "$token" "$expires_at"; then
+        exec {lock_fd}>&-
+        printf '%s\n' "$token"
+        return 0
+    fi
+
+    if [[ -z "$refresh_token" || -z "$client_id" || -z "$entry_key" ]]; then
+        exec {lock_fd}>&-
+        debug_log "Grok auth: missing refresh_token/client_id (API-key auth?)"
+        return 1
+    fi
+
+    # Tokens feed a quoted curl-config string: refuse anything outside the
+    # OAuth token alphabet rather than risk config injection.
+    if [[ ! "$refresh_token" =~ ^[A-Za-z0-9._~+/=-]+$ || ! "$client_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        exec {lock_fd}>&-
+        debug_log "Grok auth: refresh_token/client_id failed charset check"
+        return 1
+    fi
+
+    # POST body goes through the stdin config (-K -), never argv: argv is
+    # world-readable in ps and would expose the refresh token.
+    local resp http_code
+    resp=$(
+        printf 'data-urlencode = "grant_type=refresh_token"\ndata-urlencode = "refresh_token=%s"\ndata-urlencode = "client_id=%s"\n' \
+            "$refresh_token" "$client_id" | \
+        curl -s -m 8 -w '\n%{http_code}' -K - \
+            -X POST "https://auth.x.ai/oauth2/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Accept: application/json" \
+            2>/dev/null
+    ) || resp=""
+
+    http_code="${resp##*$'\n'}"
+    resp="${resp%$'\n'*}"
+
+    # invalid_grant: CLI may have rotated RT; re-read once and use that token if fresh.
+    if [[ "$http_code" != "200" ]] || ! printf '%s\n' "$resp" | jq -e '.access_token' >/dev/null 2>&1; then
+        debug_log "Grok auth: refresh HTTP ${http_code:-?} failed; re-reading auth"
+        fields=$(grok_read_auth_fields 2>/dev/null) || fields=""
+        if [[ -n "$fields" ]]; then
+            IFS=$'\x1f' read -r token entry_key refresh_token client_id expires_at <<< "$fields"
+            if [[ -n "$token" ]] && ! grok_token_needs_refresh "$token" "$expires_at"; then
+                exec {lock_fd}>&-
+                printf '%s\n' "$token"
+                return 0
+            fi
+        fi
+        exec {lock_fd}>&-
+        return 1
+    fi
+
+    local new_access new_refresh expires_in new_expires_at updated
+    new_access=$(printf '%s\n' "$resp" | jq -r '.access_token // empty' 2>/dev/null)
+    new_refresh=$(printf '%s\n' "$resp" | jq -r '.refresh_token // empty' 2>/dev/null)
+    expires_in=$(printf '%s\n' "$resp" | jq -r '.expires_in // empty' 2>/dev/null)
+    [[ -n "$new_access" ]] || { exec {lock_fd}>&-; return 1; }
+    [[ -z "$new_refresh" ]] && new_refresh="$refresh_token"
+
+    if [[ "$expires_in" =~ ^[0-9]+$ ]]; then
+        new_expires_at=$(date -u -d "+${expires_in} seconds" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+            || date -u -v+"${expires_in}"S +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+            || python3 -c "import datetime; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int('${expires_in}'))).strftime('%Y-%m-%dT%H:%M:%SZ'))" 2>/dev/null \
+            || true)
+    else
+        new_expires_at=""
+    fi
+
+    # Preserve all entries/fields; update only the matched OIDC entry.
+    updated=$(
+        jq --arg k "$entry_key" --arg at "$new_access" --arg rt "$new_refresh" --arg exp "$new_expires_at" '
+            if has($k) then
+                .[$k].key = $at
+                | (if $rt != "" then .[$k].refresh_token = $rt else . end)
+                | (if $exp != "" then .[$k].expires_at = $exp else . end)
+            else
+                .
+            end
+        ' "$auth_file" 2>/dev/null
+    ) || updated=""
+
+    if [[ -z "$updated" ]] || ! printf '%s\n' "$updated" | jq -e --arg k "$entry_key" '.[$k].key' >/dev/null 2>&1; then
+        exec {lock_fd}>&-
+        debug_log "Grok auth: jq update failed"
+        return 1
+    fi
+
+    local temp_file
+    temp_file=$(mktemp "${auth_file}.XXXXXX" 2>/dev/null) || { exec {lock_fd}>&-; return 1; }
+    if printf '%s\n' "$updated" > "$temp_file" 2>/dev/null; then
+        chmod 600 "$temp_file" 2>/dev/null
+        if mv -f "$temp_file" "$auth_file" 2>/dev/null; then
+            chmod 600 "$auth_file" 2>/dev/null
+            exec {lock_fd}>&-
+            debug_log "Grok auth: refreshed access token (len=${#new_access})"
+            printf '%s\n' "$new_access"
+            return 0
+        fi
+    fi
+    rm -f "$temp_file" 2>/dev/null
+    exec {lock_fd}>&-
+    debug_log "Grok auth: atomic write failed"
+    return 1
+}
+
+# Live billing call. Prints sanitized JSON:
+# {creditUsagePercent, periodEnd, periodType}
+# Exit 2 = auth failure (caller may refresh+retry). Exit 1 = other failure.
+grok_fetch_billing_live() {
+    local token="${1:-}"
+    [[ -n "$token" ]] || return 1
+
+    local resp http_code
+    resp=$(printf 'header = "Authorization: Bearer %s"\n' "$token" | \
+        curl -s -m 5 -K - -w '\n%{http_code}' \
+            -H "Accept: application/json" \
+            -H "User-Agent: claude-statusline/grok" \
+            "https://cli-chat-proxy.grok.com/v1/billing?format=credits" 2>/dev/null) || return 1
+
+    http_code="${resp##*$'\n'}"
+    resp="${resp%$'\n'*}"
+
+    if [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
+        return 2
+    fi
+
+    # Accept when period end is present; percent may be absent early in a fresh window.
+    if ! printf '%s\n' "$resp" | jq -e '
+        .config
+        | (.creditUsagePercent != null) or (.currentPeriod.end != null)
+    ' >/dev/null 2>&1; then
+        if printf '%s\n' "$resp" | jq -e '
+            (.error? != null) or (.message? | type == "string" and test("unauthor|auth|token"; "i"))
+        ' >/dev/null 2>&1; then
+            return 2
+        fi
+        if ! printf '%s\n' "$resp" | jq -e '.config' >/dev/null 2>&1; then
+            # Non-JSON / empty body with non-2xx: treat as auth-ish for one retry
+            if [[ ! "$http_code" =~ ^2 ]]; then
+                return 2
+            fi
+            return 1
+        fi
+        return 1
+    fi
+
+    printf '%s\n' "$resp" | jq -c '
+        .config
+        | {
+            creditUsagePercent: (.creditUsagePercent // 0),
+            periodEnd: (.currentPeriod.end // .billingPeriodEnd // null),
+            periodType: (.currentPeriod.type // null)
+          }
+    ' 2>/dev/null
+}
+
+fetch_grok_weekly_usage() {
+    local cache_file="$BASE_CACHE_DIR/grok_billing_shared"
+    local lock_file="$BASE_CACHE_DIR/grok_billing.lock"
+    local fail_marker="$BASE_CACHE_DIR/grok_billing.fail"
+    local lock_fd="" response="" token="" fields expires_at
+
+    if is_cache_valid "$cache_file" "$STATUSLINE_GROK_TTL"; then
+        cat "$cache_file" 2>/dev/null
+        return 0
+    fi
+
+    if ! is_cache_valid "$fail_marker" "$STATUSLINE_GROK_FAIL_BACKOFF"; then
+        if { exec {lock_fd}>"$lock_file"; } 2>/dev/null && [[ -n "$lock_fd" ]]; then
+            if ! command_exists flock || flock -w 4 "$lock_fd" 2>/dev/null; then
+                if is_cache_valid "$cache_file" "$STATUSLINE_GROK_TTL"; then
+                    exec {lock_fd}>&-
+                    cat "$cache_file" 2>/dev/null
+                    return 0
+                fi
+
+                # Claim the backoff before the fetch: a render killed mid-fetch
+                # (refresh + billing can take seconds on a dead network) would
+                # otherwise leave no marker and every render would stall again.
+                # Success removes it; a completed failure refreshes it below.
+                write_cache_atomic "$fail_marker" "${EPOCHSECONDS:-$(date +%s)}"
+
+                fields=$(grok_read_auth_fields 2>/dev/null) || fields=""
+                if [[ -n "$fields" ]]; then
+                    IFS=$'\x1f' read -r token _ _ _ expires_at <<< "$fields"
+                else
+                    token=""
+                fi
+
+                # Prefer a refreshed token, but never discard a still-present
+                # access token when refresh fails (revoked RT, offline, etc.).
+                if [[ -z "$token" ]] || grok_token_needs_refresh "$token" "${expires_at:-}"; then
+                    local refreshed=""
+                    refreshed=$(grok_refresh_access_token) || refreshed=""
+                    if [[ -n "$refreshed" ]]; then
+                        token="$refreshed"
+                    elif [[ -z "$token" ]]; then
+                        debug_log "Grok billing: refresh failed and no access token"
+                    else
+                        debug_log "Grok billing: refresh failed; trying existing access token"
+                    fi
+                fi
+
+                if [[ -n "$token" ]]; then
+                    local rc=0
+                    response=$(grok_fetch_billing_live "$token") || rc=$?
+                    # One refresh+retry on auth failure; keep old token if refresh fails
+                    if [[ "$rc" -eq 2 ]]; then
+                        debug_log "Grok billing: auth failure, refreshing once"
+                        local refreshed=""
+                        refreshed=$(grok_refresh_access_token) || refreshed=""
+                        if [[ -n "$refreshed" ]]; then
+                            token="$refreshed"
+                            rc=0
+                            response=$(grok_fetch_billing_live "$token") || rc=$?
+                        fi
+                    fi
+
+                    if [[ "$rc" -eq 0 && -n "$response" ]]; then
+                        write_cache_atomic "$cache_file" "$response"
+                        rm -f -- "$fail_marker" 2>/dev/null
+                        exec {lock_fd}>&-
+                        printf '%s\n' "$response"
+                        return 0
+                    fi
+                else
+                    debug_log "Grok billing: no access token available"
+                fi
+
+                write_cache_atomic "$fail_marker" "${EPOCHSECONDS:-$(date +%s)}"
+            fi
+            exec {lock_fd}>&-
+        fi
+    else
+        debug_log "Grok billing: skipping fetch (fail backoff)"
+    fi
+
+    # Stale snapshot preferred over hiding the meter.
+    if [[ -f "$cache_file" ]]; then
+        cat "$cache_file" 2>/dev/null
+        return 0
+    fi
+
+    return 1
+}
+
 # Build a single usage metric segment: emoji + pct + bar + countdown
-# Args: emoji label utilization resets_at_epoch
+# Args: emoji utilization_pct resets_at_epoch [countdown_mode: time_only|no_reset_time]
 build_usage_segment() {
     local emoji="$1" pct_val="$2" reset_epoch="$3"
     local now_epoch
@@ -574,6 +1166,45 @@ build_usage_segment() {
     printf '%s %s%d%%%s[%s]%s' "$emoji" "$color" "$pct_int" "$RST" "$bar" "$countdown"
 }
 
+# Codex's app-server returns percentage used. Render that utilization through
+# the shared bar builder so OpenAI limits have the same semantics and visual
+# treatment as Claude/GLM limits (higher usage means a fuller, warmer bar).
+build_codex_limit_segment() {
+    local used_val="$1" duration_mins="$2" reset_epoch="$3"
+    local used_int="${used_val%.*}"
+    [[ -z "$used_int" || ! "$used_int" =~ ^[0-9]+$ ]] && return 1
+
+    # resetsAt is a UNIX epoch today; tolerate null and a future ISO shape
+    if [[ ! "$reset_epoch" =~ ^[0-9]+$ ]]; then
+        if [[ -n "$reset_epoch" && "$reset_epoch" != "null" ]]; then
+            reset_epoch=$(to_epoch "$reset_epoch" 2>/dev/null) || reset_epoch=""
+        else
+            reset_epoch=""
+        fi
+    fi
+    (( used_int > 100 )) && used_int=100
+
+    local emoji skip_countdown
+    duration_mins="${duration_mins%.*}"   # tolerate a float-shaped duration
+    case "$duration_mins" in
+        # Match the icons and reset formatting of Claude's equivalent windows.
+        300)
+            emoji="⚡"
+            skip_countdown=""
+            ;;
+        10080)
+            emoji="📅"
+            skip_countdown="no_reset_time"
+            ;;
+        *)
+            emoji="⏳"
+            skip_countdown="no_reset_time"
+            ;;
+    esac
+
+    build_usage_segment "$emoji" "$used_int" "$reset_epoch" "$skip_countdown"
+}
+
 # ---- Detect model provider ----
 is_anthropic_model=false
 is_glm_model=false
@@ -586,6 +1217,18 @@ esac
 is_kimi_model=false
 case "$model_lc" in
     *"kimi"*) is_kimi_model=true ;;
+esac
+
+is_openai_model=false
+case "$model_lc" in
+    # gpt-oss is self-hosted: no ChatGPT/Codex quota applies
+    *"gpt-oss"*) ;;
+    *"gpt-"*|*"gpt "*|*"chatgpt"*|*"codex"*|*"openai"*) is_openai_model=true ;;
+esac
+
+is_grok_model=false
+case "$model_lc" in
+    *"grok"*) is_grok_model=true ;;
 esac
 
 # ---- Parse usage data and build line 1 ----
@@ -667,6 +1310,54 @@ if [[ "$is_anthropic_model" == true ]] && usage_data=$(fetch_usage_data) && [[ -
         if (( ex_int > 0 )); then
             line1_parts+=("$(build_usage_segment "💳" "$ex_pct" "")")
         fi
+    fi
+fi
+
+# ChatGPT/Codex quota windows for OpenAI models. Codex may expose the weekly
+# window as either primary or secondary depending on the account plan, so
+# label each entry from its actual duration rather than assuming an order.
+if [[ "$is_openai_model" == true ]]; then
+    codex_limits=""
+    if codex_limits=$(fetch_codex_rate_limits) && [[ -n "$codex_limits" ]]; then
+        while IFS=$'\x1f' read -r used_pct duration_mins reset_epoch; do
+            [[ -z "$used_pct" || "$used_pct" == "null" ]] && continue
+            segment=$(build_codex_limit_segment "$used_pct" "$duration_mins" "$reset_epoch" 2>/dev/null) || segment=""
+            [[ -n "$segment" ]] && line1_parts+=("$segment")
+        done < <(printf '%s\n' "$codex_limits" | jq -r '
+            [.primary, .secondary][]
+            | select(.usedPercent != null)
+            | [(.usedPercent // "null"), (.windowDurationMins // "null"), (.resetsAt // "null")]
+            | map(tostring) | join("\u001f")
+        ' 2>/dev/null)
+    fi
+fi
+
+# Grok SuperGrok weekly credit usage (only when the active model is Grok).
+# Self-hide when the Grok CLI has never logged in here (no auth file), matching
+# the Codex gate; keep the N/A marker when auth exists but the fetch fails.
+if [[ "$is_grok_model" == true && -r "$(grok_auth_path)" ]]; then
+    grok_data=""
+    if grok_data=$(fetch_grok_weekly_usage) && [[ -n "$grok_data" ]]; then
+        grok_parsed=$(printf '%s\n' "$grok_data" | jq -r '
+            [(.creditUsagePercent // "null"), (.periodEnd // "null")]
+            | map(tostring) | join("\u001f")
+        ' 2>/dev/null)
+        if [[ -n "$grok_parsed" ]]; then
+            IFS=$'\x1f' read -r grok_pct grok_period_end <<< "$grok_parsed"
+            if [[ "$grok_pct" != "null" && -n "$grok_pct" ]]; then
+                grok_epoch=""
+                if [[ "$grok_period_end" != "null" && -n "$grok_period_end" ]]; then
+                    grok_epoch=$(to_epoch "$grok_period_end" 2>/dev/null)
+                fi
+                line1_parts+=("$(build_usage_segment "📅" "$grok_pct" "$grok_epoch" "no_reset_time")")
+            else
+                line1_parts+=("${C_DIM}📅 Grok N/A${RST}")
+            fi
+        else
+            line1_parts+=("${C_DIM}📅 Grok N/A${RST}")
+        fi
+    else
+        line1_parts+=("${C_DIM}📅 Grok N/A${RST}")
     fi
 fi
 
@@ -878,6 +1569,9 @@ fi
 model_segment="🤖 ${C_MODEL}${model_name}${RST}"
 [[ -n "$effort_level" ]] && model_segment+=" ${C_MUTED}(${effort_level})${RST}"
 line2_parts+=("$model_segment")
+
+# Session cost (self-hiding; pre-formatted "X.XX" by the merged jq call)
+[[ -n "$cost_usd" ]] && line2_parts+=("${C_MUTED}💰 \$${cost_usd}${RST}")
 
 
 # ---- Build Line 3: Git + location ----

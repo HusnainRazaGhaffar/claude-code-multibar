@@ -11,6 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Syntax check
-        run: bash -n statusline.sh
+        # bash -n parses only its first argument; one invocation per file.
+        run: |
+          bash -n statusline.sh
+          bash -n subagent-statusline.sh
       - name: ShellCheck (max verbosity, zero findings expected)
-        run: shellcheck -S style statusline.sh
+        run: shellcheck -S style statusline.sh subagent-statusline.sh

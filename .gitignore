@@ -3,6 +3,7 @@
 usage_api_last_good.json
 usage_cache.json
 claude-statusline-*/
+claude-subagent-statusline-*/
 
 # Editor/backup noise
 *.bak*
