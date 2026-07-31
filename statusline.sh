@@ -121,10 +121,12 @@ is_cache_valid() {
 }
 
 # Read and validate input (no IFS save/restore needed - subshell isolation)
-if command -v timeout >/dev/null 2>&1; then
+if command_exists timeout; then
     input=$(timeout 2 cat)
+elif command_exists gtimeout; then
+    input=$(gtimeout 2 cat)  # macOS with GNU coreutils installed
 else
-    input=$(cat)  # macOS has no GNU timeout; stdin is closed by Claude Code so cat returns
+    input=$(cat)  # stock macOS: Claude Code closes stdin, so cat returns
 fi
 if ! printf '%s\n' "$input" | jq empty >/dev/null 2>&1; then
     echo "Error: Invalid JSON input" >&2
@@ -387,6 +389,7 @@ fetch_usage_data() {
                 if [[ -z "$token" ]] && command_exists security; then
                     token=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | \
                         jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+                    [[ -z "$token" ]] && debug_log "Keychain lookup returned no token"
                 fi
                 if [[ -n "$token" ]]; then
                     local resp
