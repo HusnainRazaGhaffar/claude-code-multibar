@@ -42,7 +42,7 @@ Max context, the denominator in the 🧠 segment, is auto-detected per model: 20
 - **Cache-stampede protection.** Concurrent Claude Code sessions serialize their usage-API fetch through `flock`. Where `flock` isn't available (stock macOS), the fetch proceeds unlocked instead of being skipped.
 - **Color-coded thresholds.** Bars turn yellow at 50% used and red at 80% (dim below 10%).
 - **Context-delta tracking.** Shows the change in context tokens since the last render (`+9k`), and flags a sharp drop as `(cleared)` when it looks like a compaction happened.
-- **Actionable empty state (Anthropic models).** If Anthropic usage data can't be fetched at all (not logged in, or every fallback tier failed), the line shows a hint instead of going blank. Kimi and GLM segments self-hide silently instead, matching their own gating.
+- **Actionable empty state (Anthropic models).** If Anthropic usage data can't be fetched at all, the line shows a login hint when no credentials exist (file or macOS Keychain), or an `N/A` placeholder when credentials exist but every fallback tier failed. Kimi and GLM segments self-hide silently instead, matching their own gating.
 - **Fork-frugal bash.** ANSI colors are precomputed once; the input JSON is parsed with a single merged `jq` call, and each provider's response with one merged extraction call (plus one small validation call on a live, uncached fetch); `$EPOCHSECONDS` is used instead of shelling out to `date` on bash >= 5.
 
 ## Requirements
@@ -58,6 +58,7 @@ Pure bash: no package manager, no build step.
 | `git` | Optional | Powers the 🌿 branch/dirty/ahead-behind segment. Skipped outside a git repo or without git installed. |
 | `sha256sum` | Optional | Hashes the parent PID for the cache directory name when no session ID is available. Falls back to the raw PID if missing. |
 | `python3` | Optional | Last-resort timestamp parser, used only if GNU `date`, `gdate`, and BSD `date` all fail to parse a reset time. |
+| `security` | Optional | Ships with macOS. Used twice: to read the Anthropic OAuth token from the login Keychain when the credentials file yields none, and to check (without reading any secret) whether a Keychain login exists before showing the login hint. Not present on Linux, where only the file is used. |
 
 \* Unlike `bash`/`jq`, a missing `curl` doesn't crash the script; every usage segment just self-hides. "Yes" means required for the usage bars to ever populate, not required for the script to run.
 
@@ -103,7 +104,7 @@ Everything below is an environment variable with a built-in default, so the scri
 
 Read this before pointing the script at a real session.
 
-- The script reads your Claude Code OAuth access token from `~/.claude/.credentials.json` and sends it to exactly one place: `https://api.anthropic.com/api/oauth/usage`. That endpoint is undocumented, it isn't part of Anthropic's public API, and it can change or break without notice.
+- The script reads your Claude Code OAuth access token from `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR/.credentials.json` if you have relocated Claude Code's config directory). On macOS, where Claude Code typically keeps that token in the login Keychain rather than a file, it falls back to reading the Keychain item named `Claude Code-credentials` with the `security` tool that ships with macOS; it also probes that item's existence (attributes only, never the secret) to decide between the login hint and the N/A placeholder. Wherever it came from, the token goes to exactly one place: `https://api.anthropic.com/api/oauth/usage`. That endpoint is undocumented, it isn't part of Anthropic's public API, and it can change or break without notice.
 - The token is never passed as a command-line argument. It's handed to `curl` through a small config block piped over stdin, so it never shows up in `ps` output or shell history.
 - Successful responses are cached on disk so the statusline doesn't have to call the API on every render: a shared cache under `$XDG_RUNTIME_DIR` (falling back to `$TMPDIR`, then `/tmp`) at `claude-statusline-<uid>/`, and a persistent "last known good" copy at `~/.claude/usage_api_last_good.json`, tried after the shared cache and a live fetch have both failed (the optional manual `usage_cache.json` is the true last resort). The script creates its cache directories with `chmod 700`, and cache files are written atomically through `mktemp`, whose default permissions are `0600` (owner read/write only).
 - These cached files contain the full raw response from the usage endpoint, whatever fields it happens to include. Treat them as sensitive: don't commit them or paste them into a bug report. This repo's `.gitignore` already excludes `usage_api_last_good.json`, `usage_cache.json` (an optional manual-seed fallback), and the runtime cache directories.

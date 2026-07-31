@@ -83,6 +83,32 @@ fi
 # ---- Helper Functions ----
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# Claude Code relocates its config dir via these env vars; the statusline inherits its env
+readonly CLAUDE_CFG_DIR="${CLAUDE_SECURESTORAGE_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-${HOME}/.claude}}"
+readonly CREDENTIALS_FILE="$CLAUDE_CFG_DIR/.credentials.json"
+
+# Keychain item holding the OAuth blob on a default-config macOS install
+readonly KEYCHAIN_SERVICE="Claude Code-credentials"
+
+# Presence check only: no -w, so the secret is never read here
+credentials_present() {
+    [[ -f "$CREDENTIALS_FILE" ]] && return 0
+    command_exists security || return 1
+    # Relocated config dir salts the keychain item name with a path hash; it cannot
+    # be probed by name, so abstain (treat as logged in) rather than nag falsely
+    [[ -n "${CLAUDE_SECURESTORAGE_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-}}" ]] && return 0
+    # Cache the probe: security can stall on a locked keychain, and this path runs every render that has no usage data
+    local probe_cache="$BASE_CACHE_DIR/keychain_present"
+    if ! is_cache_valid "$probe_cache" 60; then
+        local found=0
+        security find-generic-password -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1 && found=1
+        write_cache_atomic "$probe_cache" "$found"
+    fi
+    local cached=""
+    [[ -r "$probe_cache" ]] && cached=$(<"$probe_cache")
+    [[ "$cached" == "1" ]]
+}
+
 # Atomic file write
 write_cache_atomic() {
     local file="${1:-}" content="${2:-}"
@@ -367,7 +393,8 @@ fetch_usage_data() {
     else
         # 3) Acquire lock (wait up to 4s). Prevents cache stampede.
         local lock_fd=""
-        if exec {lock_fd}>"$lock_file" 2>/dev/null && [[ -n "$lock_fd" ]]; then
+        # Brace group scopes the 2>/dev/null: bare on exec it would silence this subshell for good
+        if { exec {lock_fd}>"$lock_file"; } 2>/dev/null && [[ -n "$lock_fd" ]]; then
             # flock(1) may be absent (stock macOS): proceed unlocked rather
             # than never fetching; worst case is a duplicate curl.
             if ! command_exists flock || flock -w 4 "$lock_fd" 2>/dev/null; then
@@ -379,15 +406,14 @@ fetch_usage_data() {
                 fi
 
                 # Actually fetch from OAuth API
-                local creds_file="${HOME}/.claude/.credentials.json"
                 local fetched=false
                 local token=""
-                if [[ -f "$creds_file" ]]; then
-                    token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
+                if [[ -f "$CREDENTIALS_FILE" ]]; then
+                    token=$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDENTIALS_FILE" 2>/dev/null)
                 fi
                 # macOS: Claude Code stores OAuth creds in the Keychain, not .credentials.json
                 if [[ -z "$token" ]] && command_exists security; then
-                    token=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | \
+                    token=$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null | \
                         jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
                     [[ -z "$token" ]] && debug_log "Keychain lookup returned no token"
                 fi
@@ -435,7 +461,7 @@ fetch_usage_data() {
     fi
 
     # 6) Fallback: manual cache file. Read-only; never written to api_cache, which would refresh its mtime and short-circuit the API fetch on every subsequent run.
-    if [[ -f "$manual_cache" ]]; then
+    if [[ -r "$manual_cache" ]]; then
         local manual_data
         manual_data=$(<"$manual_cache")
         if printf '%s\n' "$manual_data" | jq -e '.five_hour' >/dev/null 2>&1; then
@@ -471,6 +497,7 @@ fetch_kimi_balance() {
         printf '%s\n' "$resp"
         return 0
     fi
+    debug_log "Kimi balance API returned unexpected response"
 
     # Stale cache fallback
     [[ -f "$cache_file" ]] && cat "$cache_file" 2>/dev/null && return 0
@@ -508,6 +535,7 @@ fetch_glm_quota() {
         printf '%s\n' "$resp"
         return 0
     fi
+    debug_log "GLM quota API returned unexpected response"
 
     [[ -f "$cache_file" ]] && cat "$cache_file" 2>/dev/null && return 0
     return 1
@@ -563,7 +591,7 @@ esac
 # ---- Parse usage data and build line 1 ----
 declare -a line1_parts=()
 usage_data=""
-if [[ "$is_anthropic_model" == true ]] && usage_data=$(fetch_usage_data 2>/dev/null) && [[ -n "$usage_data" ]]; then
+if [[ "$is_anthropic_model" == true ]] && usage_data=$(fetch_usage_data) && [[ -n "$usage_data" ]]; then
     debug_log "Got usage data"
 
     # Parse all metrics in a single jq call
@@ -645,7 +673,7 @@ fi
 # Kimi balance (only when using Kimi model)
 if [[ "$is_kimi_model" == true && -n "${MOONSHOT_API_KEY:-}" ]]; then
     kimi_data=""
-    if kimi_data=$(fetch_kimi_balance 2>/dev/null) && [[ -n "$kimi_data" ]]; then
+    if kimi_data=$(fetch_kimi_balance) && [[ -n "$kimi_data" ]]; then
         kimi_balance=$(printf '%s\n' "$kimi_data" | jq -r '.data.available_balance // empty' 2>/dev/null)
         if [[ -n "$kimi_balance" ]]; then
             line1_parts+=("${C_MUTED}💰 ¥${kimi_balance}${RST}")
@@ -656,7 +684,7 @@ fi
 # GLM Coding Plan quota (if GLM model active)
 if [[ "$is_glm_model" == true && -n "${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
     glm_data=""
-    if glm_data=$(fetch_glm_quota 2>/dev/null) && [[ -n "$glm_data" ]]; then
+    if glm_data=$(fetch_glm_quota) && [[ -n "$glm_data" ]]; then
         glm_parsed=$(printf '%s\n' "$glm_data" | jq -r '
             (.data.limits[] | select(.type == "TOKENS_LIMIT") | .percentage // "null"),
             (.data.limits[] | select(.type == "TOKENS_LIMIT") | .nextResetTime // "null"),
@@ -695,7 +723,7 @@ fi
 
 # If no usage data available, show actionable hint (only for Anthropic models)
 if [[ "$is_anthropic_model" == true && ${#line1_parts[@]} -eq 0 ]]; then
-    if [[ ! -f "${HOME}/.claude/.credentials.json" ]]; then
+    if ! credentials_present; then
         line1_parts+=("${C_DIM}⚡ run 'claude login' for usage stats${RST}")
     else
         line1_parts+=("${C_DIM}⚡ N/A  📅 N/A${RST}")
