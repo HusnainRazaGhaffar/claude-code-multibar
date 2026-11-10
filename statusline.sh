@@ -5,16 +5,6 @@
 # is optional for read-only fetches (they proceed unlocked without it), but
 # the Grok token refresh REQUIRES it and is skipped when absent (fail closed:
 # an unlocked concurrent refresh can revoke the token family).
-# v4.1 - Idle-window fix + stale-data marker
-# - A usage response with five_hour: null (no 5-hour window reported) is
-#   valid. It was rejected as a failed fetch, which froze the bars on the
-#   last snapshot that still carried one. The ⚡ segment hides while the
-#   window is absent and returns when the API reports it again.
-# - 5-hour and weekly windows also read from limits[] (session / weekly_all)
-#   when the flat five_hour / seven_day keys are null.
-# - A limit whose resets_at has passed renders as 0% (the window rolled over).
-# - "⚠ <age> old" marker when the usage numbers come from a fallback cache.
-# - Orphaned usage_api_last_good.json.?????? temp files are cleaned up.
 # v4.0 - Provider hardening + sub-agent companion
 # - Grok: refresh fail-closed without flock; refresh token moved off curl argv
 #   (config via stdin); segment self-hides when no ~/.grok/auth.json exists;
@@ -1166,14 +1156,6 @@ build_usage_segment() {
     local pct_int="${pct_val%.*}"
     [[ -z "$pct_int" || ! "$pct_int" =~ ^[0-9]+$ ]] && pct_int=0
 
-    # A reset time in the past means the window already rolled over: whatever
-    # percentage came with it belongs to the old window, so show 0% and no
-    # countdown instead of a frozen number next to "now".
-    if [[ "$reset_epoch" =~ ^[0-9]+$ ]] && (( reset_epoch <= now_epoch )); then
-        pct_int=0
-        reset_epoch=""
-    fi
-
     local color
     color=$(pct_color "$pct_int")
     local bar
@@ -1194,6 +1176,19 @@ build_usage_segment() {
     fi
 
     printf '%s %s%d%%%s[%s]%s' "$emoji" "$color" "$pct_int" "$RST" "$bar" "$countdown"
+}
+
+# Anthropic limits only. A resets_at in the past means that window already
+# rolled over: the percentage that came with it belongs to the old window, so
+# draw 0% and no countdown instead of a frozen number next to "now". Other
+# providers go straight to build_usage_segment and keep their own semantics.
+build_anthropic_segment() {
+    local emoji="$1" pct_val="$2" reset_epoch="${3:-}"
+    if [[ "$reset_epoch" =~ ^[0-9]+$ ]] && (( reset_epoch <= ${EPOCHSECONDS:-$(date +%s)} )); then
+        pct_val=0
+        reset_epoch=""
+    fi
+    build_usage_segment "$emoji" "$pct_val" "$reset_epoch" "${4:-}"
 }
 
 # Codex's app-server returns percentage used. Render that utilization through
@@ -1297,7 +1292,7 @@ if [[ "$is_anthropic_model" == true ]] && usage_data=$(fetch_usage_data) && [[ -
             if [[ "$u5h_reset" != "null" ]]; then
                 reset_epoch=$(to_epoch "$u5h_reset" 2>/dev/null)
             fi
-            line1_parts+=("$(build_usage_segment "⚡" "$u5h_pct" "$reset_epoch")")
+            line1_parts+=("$(build_anthropic_segment "⚡" "$u5h_pct" "$reset_epoch")")
         fi
         # No 5-hour window in the response (neither five_hour nor a session
         # entry in limits[]): the segment is hidden rather than drawn as 0%,
@@ -1307,14 +1302,14 @@ if [[ "$is_anthropic_model" == true ]] && usage_data=$(fetch_usage_data) && [[ -
         if [[ "$u7d_pct" != "null" && -n "$u7d_pct" ]]; then
             u7d_epoch=""
             [[ "$u7d_reset" != "null" ]] && u7d_epoch=$(to_epoch "$u7d_reset" 2>/dev/null)
-            line1_parts+=("$(build_usage_segment "📅" "$u7d_pct" "$u7d_epoch" "no_reset_time")")
+            line1_parts+=("$(build_anthropic_segment "📅" "$u7d_pct" "$u7d_epoch" "no_reset_time")")
         fi
 
         # 7-day Sonnet (only if non-null)
         if [[ "$u7ds_pct" != "null" && -n "$u7ds_pct" ]]; then
             u7ds_epoch=""
             [[ "$u7ds_reset" != "null" ]] && u7ds_epoch=$(to_epoch "$u7ds_reset" 2>/dev/null)
-            line1_parts+=("$(build_usage_segment "🎵" "$u7ds_pct" "$u7ds_epoch" "no_reset_time")")
+            line1_parts+=("$(build_anthropic_segment "🎵" "$u7ds_pct" "$u7ds_epoch" "no_reset_time")")
         fi
 
         # 7-day Opus (only if non-null)
@@ -1323,7 +1318,7 @@ if [[ "$is_anthropic_model" == true ]] && usage_data=$(fetch_usage_data) && [[ -
             if [[ "$u7do_reset" != "null" ]]; then
                 reset_epoch=$(to_epoch "$u7do_reset" 2>/dev/null)
             fi
-            line1_parts+=("$(build_usage_segment "🎭" "$u7do_pct" "$reset_epoch")")
+            line1_parts+=("$(build_anthropic_segment "🎭" "$u7do_pct" "$reset_epoch")")
         fi
     fi
 
@@ -1334,7 +1329,7 @@ if [[ "$is_anthropic_model" == true ]] && usage_data=$(fetch_usage_data) && [[ -
         [[ -z "$scoped_pct" || "$scoped_pct" == "null" ]] && continue
         scoped_epoch=""
         [[ "$scoped_reset" != "null" ]] && scoped_epoch=$(to_epoch "$scoped_reset" 2>/dev/null)
-        line1_parts+=("$(build_usage_segment "📖" "$scoped_pct" "$scoped_epoch" "no_reset_time")")
+        line1_parts+=("$(build_anthropic_segment "📖" "$scoped_pct" "$scoped_epoch" "no_reset_time")")
     done < <(printf '%s\n' "$usage_data" | jq -r '
         .limits[]? | select(.kind == "weekly_scoped")
         | [(.percent // "null"), (.resets_at // "null")]
