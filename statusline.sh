@@ -186,6 +186,10 @@ maybe_cleanup_sessions() {
         -o -name 'context_*.??????' \
         -o -name 'previous_tokens.??????' \) \
         -delete 2>/dev/null
+    # write_cache_atomic leaves its mktemp file behind when the script is
+    # killed between mktemp and mv; the persistent cache lives in ~/.claude.
+    find "${HOME}/.claude" -maxdepth 1 -type f -mmin +60 \
+        -name 'usage_api_last_good.json.??????' -delete 2>/dev/null
     # Lock files are deliberately not swept: unlinking a held lock makes the
     # next opener lock a different inode, breaking mutual exclusion.
     # A render killed mid-refresh can orphan a mktemp file holding tokens
@@ -440,6 +444,14 @@ print(int(datetime.datetime.fromisoformat(s).timestamp()))
 # session/weekly percentages. This OAuth response is richer: extra-usage
 # credits, weekly model-scoped promo limits, and per-model legacy splits.
 
+# Is stdin a usage payload? five_hour is null whenever the API reports no
+# 5-hour window, so its truthiness cannot be the test: key presence is.
+# Error bodies ({"type":"error",...}) carry none of these keys.
+is_usage_response() {
+    jq -e 'type == "object" and (has("five_hour") or has("seven_day")
+           or ((.limits? // null) | type == "array"))' >/dev/null 2>&1
+}
+
 fetch_usage_data() {
     local api_cache="$BASE_CACHE_DIR/usage_api_shared"
     local persistent_cache="${HOME}/.claude/usage_api_last_good.json"
@@ -495,7 +507,7 @@ fetch_usage_data() {
                             -H "anthropic-beta: oauth-2025-04-20" \
                             -H "User-Agent: claude-code/${cc_version:-2.1.17}" \
                             "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
-                    if printf '%s\n' "$resp" | jq -e '.five_hour' >/dev/null 2>&1; then
+                    if printf '%s\n' "$resp" | is_usage_response; then
                         write_cache_atomic "$api_cache" "$resp"
                         # Persist last good response (survives reboots)
                         write_cache_atomic "$persistent_cache" "$resp"
@@ -535,7 +547,7 @@ fetch_usage_data() {
     if [[ -r "$manual_cache" ]]; then
         local manual_data
         manual_data=$(<"$manual_cache")
-        if printf '%s\n' "$manual_data" | jq -e '.five_hour' >/dev/null 2>&1; then
+        if printf '%s\n' "$manual_data" | is_usage_response; then
             printf '%s\n' "$manual_data"
             return 0
         fi
@@ -1166,6 +1178,19 @@ build_usage_segment() {
     printf '%s %s%d%%%s[%s]%s' "$emoji" "$color" "$pct_int" "$RST" "$bar" "$countdown"
 }
 
+# Anthropic limits only. A resets_at in the past means that window already
+# rolled over: the percentage that came with it belongs to the old window, so
+# draw 0% and no countdown instead of a frozen number next to "now". Other
+# providers go straight to build_usage_segment and keep their own semantics.
+build_anthropic_segment() {
+    local emoji="$1" pct_val="$2" reset_epoch="${3:-}"
+    if [[ "$reset_epoch" =~ ^[0-9]+$ ]] && (( reset_epoch <= ${EPOCHSECONDS:-$(date +%s)} )); then
+        pct_val=0
+        reset_epoch=""
+    fi
+    build_usage_segment "$emoji" "$pct_val" "$reset_epoch" "${4:-}"
+}
+
 # Codex's app-server returns percentage used. Render that utilization through
 # the shared bar builder so OpenAI limits have the same semantics and visual
 # treatment as Claude/GLM limits (higher usage means a fuller, warmer bar).
@@ -1238,11 +1263,17 @@ if [[ "$is_anthropic_model" == true ]] && usage_data=$(fetch_usage_data) && [[ -
     debug_log "Got usage data"
 
     # Parse all metrics in a single jq call
+    # The flat five_hour / seven_day keys and the structured limits[] entries
+    # (kind "session" / "weekly_all") carry the same numbers. Either can be
+    # null or missing depending on what the API reports for the account, so
+    # each window is read from the flat key first, then from limits[].
     usage_parsed=$(printf '%s\n' "$usage_data" | jq -r '
-        (.five_hour.utilization // "null"),
-        (.five_hour.resets_at // "null"),
-        (.seven_day.utilization // "null"),
-        (.seven_day.resets_at // "null"),
+        ([.limits[]? | select(.kind == "session")][0]) as $s
+        | ([.limits[]? | select(.kind == "weekly_all")][0]) as $w
+        | (.five_hour.utilization // $s.percent // "null"),
+        (.five_hour.resets_at // $s.resets_at // "null"),
+        (.seven_day.utilization // $w.percent // "null"),
+        (.seven_day.resets_at // $w.resets_at // "null"),
         (.seven_day_sonnet.utilization // "null"),
         (.seven_day_sonnet.resets_at // "null"),
         (.seven_day_opus.utilization // "null"),
@@ -1261,21 +1292,24 @@ if [[ "$is_anthropic_model" == true ]] && usage_data=$(fetch_usage_data) && [[ -
             if [[ "$u5h_reset" != "null" ]]; then
                 reset_epoch=$(to_epoch "$u5h_reset" 2>/dev/null)
             fi
-            line1_parts+=("$(build_usage_segment "⚡" "$u5h_pct" "$reset_epoch")")
+            line1_parts+=("$(build_anthropic_segment "⚡" "$u5h_pct" "$reset_epoch")")
         fi
+        # No 5-hour window in the response (neither five_hour nor a session
+        # entry in limits[]): the segment is hidden rather than drawn as 0%,
+        # and comes back by itself when the API reports the window again.
 
         # 7-day all models
         if [[ "$u7d_pct" != "null" && -n "$u7d_pct" ]]; then
             u7d_epoch=""
             [[ "$u7d_reset" != "null" ]] && u7d_epoch=$(to_epoch "$u7d_reset" 2>/dev/null)
-            line1_parts+=("$(build_usage_segment "📅" "$u7d_pct" "$u7d_epoch" "no_reset_time")")
+            line1_parts+=("$(build_anthropic_segment "📅" "$u7d_pct" "$u7d_epoch" "no_reset_time")")
         fi
 
         # 7-day Sonnet (only if non-null)
         if [[ "$u7ds_pct" != "null" && -n "$u7ds_pct" ]]; then
             u7ds_epoch=""
             [[ "$u7ds_reset" != "null" ]] && u7ds_epoch=$(to_epoch "$u7ds_reset" 2>/dev/null)
-            line1_parts+=("$(build_usage_segment "🎵" "$u7ds_pct" "$u7ds_epoch" "no_reset_time")")
+            line1_parts+=("$(build_anthropic_segment "🎵" "$u7ds_pct" "$u7ds_epoch" "no_reset_time")")
         fi
 
         # 7-day Opus (only if non-null)
@@ -1284,7 +1318,7 @@ if [[ "$is_anthropic_model" == true ]] && usage_data=$(fetch_usage_data) && [[ -
             if [[ "$u7do_reset" != "null" ]]; then
                 reset_epoch=$(to_epoch "$u7do_reset" 2>/dev/null)
             fi
-            line1_parts+=("$(build_usage_segment "🎭" "$u7do_pct" "$reset_epoch")")
+            line1_parts+=("$(build_anthropic_segment "🎭" "$u7do_pct" "$reset_epoch")")
         fi
     fi
 
@@ -1295,7 +1329,7 @@ if [[ "$is_anthropic_model" == true ]] && usage_data=$(fetch_usage_data) && [[ -
         [[ -z "$scoped_pct" || "$scoped_pct" == "null" ]] && continue
         scoped_epoch=""
         [[ "$scoped_reset" != "null" ]] && scoped_epoch=$(to_epoch "$scoped_reset" 2>/dev/null)
-        line1_parts+=("$(build_usage_segment "📖" "$scoped_pct" "$scoped_epoch" "no_reset_time")")
+        line1_parts+=("$(build_anthropic_segment "📖" "$scoped_pct" "$scoped_epoch" "no_reset_time")")
     done < <(printf '%s\n' "$usage_data" | jq -r '
         .limits[]? | select(.kind == "weekly_scoped")
         | [(.percent // "null"), (.resets_at // "null")]
@@ -1309,6 +1343,22 @@ if [[ "$is_anthropic_model" == true ]] && usage_data=$(fetch_usage_data) && [[ -
         [[ "$ex_int" =~ ^[0-9]+$ ]] || ex_int=0
         if (( ex_int > 0 )); then
             line1_parts+=("$(build_usage_segment "💳" "$ex_pct" "")")
+        fi
+    fi
+
+    # Stale marker: same source order as the fetch_usage_data fallbacks. A
+    # healthy run serves a cache younger than the TTL; anything much older
+    # means the API fetch keeps failing and these numbers are a snapshot.
+    usage_src=""
+    for f in "$BASE_CACHE_DIR/usage_api_shared" \
+             "${HOME}/.claude/usage_api_last_good.json" \
+             "${HOME}/.claude/usage_cache.json"; do
+        [[ -f "$f" ]] && { usage_src="$f"; break; }
+    done
+    if [[ -n "$usage_src" ]]; then
+        usage_age=$(( ${EPOCHSECONDS:-$(date +%s)} - $(file_mtime "$usage_src") ))
+        if (( usage_age > STATUSLINE_USAGE_TTL + STATUSLINE_USAGE_FAIL_BACKOFF + 300 )); then
+            line1_parts+=("${C_YELLOW}⚠ $(fmt_countdown "$usage_age") old${RST}")
         fi
     fi
 fi
